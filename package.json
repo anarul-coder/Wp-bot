@@ -1,0 +1,16 @@
+{
+  "name": "whatsapp-qr-bridge",
+  "version": "1.0.0",
+  "private": true,
+  "description": "WhatsApp QR bridge for private AI bot",
+  "main": "bridge.js",
+  "scripts": { "start": "node bridge.js" },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.18",
+    "axios": "^1.7.9",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "pino": "^9.6.0",
+    "qrcode": "^1.5.4"
+  }
+}

@@ -1,0 +1,36 @@
+services:
+  - type: web
+    name: whatsapp-qr-dashboard
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --workers 1 --threads 4 --timeout 120
+    envVars:
+      - key: WHATSAPP_BRIDGE_URL
+        value: http://whatsapp-qr-bridge:3001
+      - key: BRIDGE_SECRET
+        sync: false
+      - key: ALLOWED_PHONE_NUMBER
+        sync: false
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: OPENROUTER_MODEL
+        value: openrouter/free
+      - key: PUBLIC_APP_URL
+        sync: false
+
+  - type: web
+    name: whatsapp-qr-bridge
+    runtime: node
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: BRIDGE_SECRET
+        sync: false
+      - key: PYTHON_APP_URL
+        value: http://whatsapp-qr-dashboard:10000
+      - key: AUTH_DIR
+        value: /var/data/auth_info
+    disk:
+      name: whatsapp-session
+      mountPath: /var/data
+      sizeGB: 1
