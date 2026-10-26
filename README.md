@@ -1,40 +1,35 @@
-# Private WhatsApp AI Bot — QR dashboard + allowlisted number
+# Python-only WhatsApp QR AI Bot
 
-## What this does
-- Shows a QR code on an HTML dashboard for linking a WhatsApp Web session.
-- Receives private text messages through a separate Node.js Baileys bridge.
-- Replies using OpenRouter.
-- Replies ONLY when the sender's number matches `ALLOWED_PHONE_NUMBER` in `.env`.
-- Ignores all other senders.
-- Uses Python/Flask for the dashboard, allowlist, and OpenRouter requests.
+This starter uses `piwapp`, a pure-Python WhatsApp Web client, Flask, and OpenRouter. No JavaScript/Node.js bridge is used.
 
-## Configure `.env`
-Copy `.env.example` to `.env` and fill in:
-- `ALLOWED_PHONE_NUMBER`: your one allowed WhatsApp number in international format, digits only, no plus sign. Example format: `8801XXXXXXXXX`.
-- `OPENROUTER_API_KEY`: your secret API key.
-- `BRIDGE_SECRET`: long random shared secret.
-- Local URLs shown in the example are fine for local testing.
+## Render settings
 
-Do not commit `.env` or share your API key. `.gitignore` excludes `.env`.
+- Runtime: Python
+- Build command: `pip install -r requirements.txt`
+- Start command: `gunicorn app:app --bind 0.0.0.0:$PORT`
+- Python version: 3.12 (provided by `.python-version`)
 
-## Run locally
-Terminal 1:
-```bash
-npm install
-npm start
-```
-Terminal 2:
-```bash
-python -m venv .venv
-# activate the virtual environment, then:
-pip install -r requirements.txt
-python app.py
-```
-Open `http://localhost:10000`. Scan the QR using WhatsApp > Linked devices > Link a device.
-Make sure both processes load the same `.env` (Node and Python use dotenv).
+## Environment variables
 
-## Render
-Deploy the Python dashboard and Node bridge as two services. Set the environment variables in each service's Render dashboard. Use the actual private/internal service URLs Render provides; replace the sample URLs if needed. Set `BRIDGE_SECRET` to the exact same value in both services. Set `ALLOWED_PHONE_NUMBER` and `OPENROUTER_API_KEY` on the Python service. A persistent disk for the Node service is needed to retain the WhatsApp session; check Render's current plan requirements and pricing.
+Set these in Render:
+- `ALLOWED_PHONE_NUMBER`: only this sender can receive AI replies, digits only, international format, e.g. `88017XXXXXXXX`
+- `OPENROUTER_API_KEY`: your API key
+- `OPENROUTER_MODEL`: `openrouter/free`
+- `PUBLIC_APP_URL`: your actual Render URL
+- `PIWAPP_AUTH_FILE`: `/var/data/piwapp_auth.json`
 
-## Important
-This is an unofficial WhatsApp Web integration, not the official WhatsApp Cloud API. It may break or violate WhatsApp terms; the official Cloud API is preferable for production/business use. Keep the QR dashboard private, since anyone who scans the QR can link a device. The code filters incoming messages to one configured number before sending any message to OpenRouter, and only replies to that number.
+## Persistent storage
+
+Add a persistent disk to the Render service with mount path `/var/data`. WhatsApp auth credentials and keys must persist across restarts. Persistent disks may require a paid Render plan. Without persistent storage, the login session may be lost after restart/redeploy.
+
+## Pairing
+
+Open the app URL and scan the QR displayed by the dashboard:
+WhatsApp > Linked devices > Link a device.
+
+## Notes
+
+- This uses an unofficial WhatsApp Web protocol client; use at your own risk and follow WhatsApp's terms.
+- Test with a spare account first.
+- The WhatsApp QR connection runs in the same Python process as Flask; avoid multiple instances of this service.
+- `piwapp` requires Python 3.12+ and its APIs may change as the project evolves.
