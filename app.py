@@ -93,13 +93,11 @@ def normalize_number(jid: str) -> str:
     if not jid or "@" not in jid:
         return ""
     head = jid.split("@", 1)[0]
-    # WhatsApp sometimes appends ":device" to the number part.
     head = head.split(":", 1)[0]
     return re.sub(r"\D", "", head)
 
 
 def extract_text(message: dict) -> str:
-    """Pull text from common WhatsApp message shapes."""
     if message.get("text"):
         return str(message["text"]).strip()
 
@@ -154,7 +152,6 @@ def ask_openrouter(user_text: str) -> str:
         if not resp.ok:
             log.error("OpenRouter HTTP %s: %s", resp.status_code, resp.text[:400])
             return f"AI service temporarily unavailable (HTTP {resp.status_code})."
-
         data = resp.json()
         return data["choices"][0]["message"]["content"].strip()
     except Exception:
@@ -173,9 +170,16 @@ def start_whatsapp_background():
 
     def thread_main():
         try:
-            # Imported inside the thread so import errors don't crash Flask.
-            from piwapp import Client, ConnectionConfig, AuthenticationCreds
-            from piwapp.events import WAEventType
+            # Verify imports explicitly so errors are caught
+            try:
+                from piwapp import Client, ConnectionConfig, AuthenticationCreds
+                from piwapp.events import WAEventType
+            except Exception as import_err:
+                log.exception("Failed to import piwapp. Is it in requirements.txt?")
+                update_state(status="error", error=f"piwapp import failed: {import_err}")
+                with start_lock:
+                    _started["value"] = False
+                return
 
             AUTH_FILE.parent.mkdir(parents=True, exist_ok=True)
             KEYS_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -187,6 +191,7 @@ def start_whatsapp_background():
                     "Mount a persistent disk and set PIWAPP_AUTH_FILE under it."
                 )
 
+            # Load or create credentials
             if AUTH_FILE.exists():
                 creds = AuthenticationCreds.from_json(AUTH_FILE.read_text(encoding="utf-8"))
             else:
@@ -213,6 +218,7 @@ def start_whatsapp_background():
             client_ref["loop"] = loop
 
             # ---- connection.update ----
+            # CRITICAL FIX: piwapp requires this to be an `async def` to capture QR codes
             async def on_connection(update: dict):
                 try:
                     if update.get("qr"):
@@ -223,6 +229,8 @@ def start_whatsapp_background():
                             connected=False,
                             error=None,
                         )
+                        log.info("QR code generated. Waiting for scan.")
+                    
                     conn = update.get("connection")
                     if conn == "open":
                         me = (update.get("me") or {}).get("id")
@@ -256,7 +264,6 @@ def start_whatsapp_background():
                         RECENT_MESSAGE_IDS.append(msg_id)
 
                     remote_jid = key.get("remoteJid") or ""
-                    # Skip groups, status broadcasts, and other non-DM chats.
                     if not remote_jid.endswith("@s.whatsapp.net"):
                         return
 
@@ -272,13 +279,12 @@ def start_whatsapp_background():
                     if not text:
                         return
 
-                    update_state(
-                        last_message=f"Received {len(text)} chars from {sender}",
-                    )
+                    update_state(last_message=f"Received {len(text)} chars from {sender}")
                     log.info("Handling message from %s (%d chars)", sender, len(text))
 
                     reply = await asyncio.to_thread(ask_openrouter, text)
                     await client.send_text(remote_jid, reply)
+                    
                     with state_lock:
                         state["messages_handled"] += 1
                 except Exception:
@@ -292,19 +298,22 @@ def start_whatsapp_background():
                 for msg in messages or []:
                     asyncio.run_coroutine_threadsafe(handle_message(client, msg), loop)
 
+            # Register listeners
             client.on("connection.update", on_connection)
             client.events.on(WAEventType.MESSAGES_UPSERT, on_messages)
 
             update_state(status="connecting", error=None)
-            log.info("Starting piwapp client…")
+            log.info("Starting piwapp client loop...")
+            
+            # This blocks the thread and runs the WhatsApp client
             loop.run_until_complete(client.start())
 
         except Exception as exc:
-            log.exception("WhatsApp startup failed")
+            log.exception("WhatsApp startup failed entirely")
             update_state(
                 status="error",
                 connected=False,
-                error="Startup failed. Check logs for details.",
+                error=f"Startup failed: {type(exc).__name__}",
             )
         finally:
             with start_lock:
