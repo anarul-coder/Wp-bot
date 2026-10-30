@@ -1,35 +1,43 @@
-# Python-only WhatsApp QR AI Bot
+# Python WhatsApp AI Bot
 
-This starter uses `piwapp`, a pure-Python WhatsApp Web client, Flask, and OpenRouter. No JavaScript/Node.js bridge is used.
+Pure-Python WhatsApp bot:
+- **Flask** dashboard with QR login
+- **piwapp** (unofficial WhatsApp Web client)
+- **OpenRouter** for AI replies
+- No Node.js. No bridge service.
 
-## Render settings
+## Deploy on Render
 
-- Runtime: Python
-- Build command: `pip install -r requirements.txt`
-- Start command: `gunicorn app:app --bind 0.0.0.0:$PORT`
-- Python version: 3.12 (provided by `.python-version`)
+1. Push this repo to GitHub.
+2. Create a **Web Service** on Render.
+3. Build: `pip install -r requirements.txt`
+4. Start: `gunicorn app:app --workers 1 --threads 4 --timeout 120 --bind 0.0.0.0:$PORT`
+5. Add a **persistent disk** mounted at `/var/data` (paid plan required).
+6. Set environment variables:
+   - `ALLOWED_PHONE_NUMBER` — digits only, e.g. `88017XXXXXXXX`
+   - `OPENROUTER_API_KEY`
+   - `OPENROUTER_MODEL` — default `openrouter/free`
+   - `PUBLIC_APP_URL` — your Render URL
+   - `PIWAPP_AUTH_FILE` — `/var/data/whatsapp/auth.json`
+   - `DASHBOARD_TOKEN` — a long random string (recommended)
+7. Deploy, open the URL (`?token=YOUR_TOKEN`), scan the QR.
 
-## Environment variables
+## Important rules
 
-Set these in Render:
-- `ALLOWED_PHONE_NUMBER`: only this sender can receive AI replies, digits only, international format, e.g. `88017XXXXXXXX`
-- `OPENROUTER_API_KEY`: your API key
-- `OPENROUTER_MODEL`: `openrouter/free`
-- `PUBLIC_APP_URL`: your actual Render URL
-- `PIWAPP_AUTH_FILE`: `/var/data/piwapp_auth.json`
+- **One worker only.** `piwapp` cannot share a session across processes.
+- **Persistent disk is required** for the login to survive restarts.
+  Without it, you must re-scan the QR after every redeploy or idle spin-down.
+- **Keep the dashboard URL secret.** The QR allows anyone to link a device.
+- **Only the sender matching `ALLOWED_PHONE_NUMBER` gets AI replies.** All other
+  numbers and all groups are ignored.
+- `piwapp` is **unofficial**. WhatsApp may change protocol and break it, or
+  restrict accounts. Use a spare number. Follow WhatsApp's Terms of Service.
 
-## Persistent storage
+## Local test
 
-Add a persistent disk to the Render service with mount path `/var/data`. WhatsApp auth credentials and keys must persist across restarts. Persistent disks may require a paid Render plan. Without persistent storage, the login session may be lost after restart/redeploy.
-
-## Pairing
-
-Open the app URL and scan the QR displayed by the dashboard:
-WhatsApp > Linked devices > Link a device.
-
-## Notes
-
-- This uses an unofficial WhatsApp Web protocol client; use at your own risk and follow WhatsApp's terms.
-- Test with a spare account first.
-- The WhatsApp QR connection runs in the same Python process as Flask; avoid multiple instances of this service.
-- `piwapp` requires Python 3.12+ and its APIs may change as the project evolves.
+```bash
+cp .env.example .env
+# edit .env with your values
+pip install -r requirements.txt
+python app.py
+# open http://localhost:10000
