@@ -1,5 +1,6 @@
 """
 Pure-Python WhatsApp AI Bot (using wars)
+- Now with OpenRouter Web Search support
 """
 
 import logging
@@ -26,13 +27,23 @@ logging.basicConfig(
 )
 log = logging.getLogger("wa-bot")
 
-ALLOWED_PHONE = re.sub(r"\D", "", os.getenv("ALLOWED_PHONE_NUMBER", ""))
+# Allowed Senders
+_raw_phone = os.getenv("ALLOWED_PHONE_NUMBER", "")
+ALLOWED_PHONE = re.sub(r"\D", "", _raw_phone)
+
+_raw_lids = os.getenv("ALLOWED_LIDS", "")
+ALLOWED_LIDS = [re.sub(r"\D", "", lid) for lid in _raw_lids.split(",") if lid.strip()]
+
+# OpenRouter Config
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openrouter/free").strip()
 PUBLIC_APP_URL = os.getenv("PUBLIC_APP_URL", "").strip() or "https://render.com"
 DASHBOARD_TOKEN = os.getenv("DASHBOARD_TOKEN", "").strip()
 
-# Default to /tmp for Render Free Tier compatibility
+# If you want to FORCE web search on every message, set this to True
+# But note it costs $4 per 1000 results.
+ENABLE_WEB_SEARCH = os.getenv("ENABLE_WEB_SEARCH", "true").lower() == "true"
+
 DB_FILE = Path(os.getenv("WARS_DB_FILE", "/tmp/whatsapp.db"))
 
 MAX_INPUT_CHARS = 4000
@@ -90,6 +101,14 @@ def ask_openrouter(user_text: str) -> str:
         return "Bot is not fully configured: OPENROUTER_API_KEY is missing."
     if len(user_text) > MAX_INPUT_CHARS:
         user_text = user_text[:MAX_INPUT_CHARS]
+
+    # --- WEB SEARCH LOGIC ---
+    # If ENABLE_WEB_SEARCH is True, we use the :online suffix
+    model_to_use = OPENROUTER_MODEL
+    if ENABLE_WEB_SEARCH and ":online" not in model_to_use:
+        model_to_use = f"{model_to_use}:online"
+        log.info("Using Web Search Model: %s", model_to_use)
+
     try:
         resp = requests.post(
             "https://openrouter.ai/api/v1/chat/completions",
@@ -100,9 +119,9 @@ def ask_openrouter(user_text: str) -> str:
                 "X-Title": "Python WhatsApp AI Bot",
             },
             json={
-                "model": OPENROUTER_MODEL,
+                "model": model_to_use,
                 "messages": [
-                    {"role": "system", "content": "You are a helpful WhatsApp assistant. Reply naturally and concisely. Match the language of the user (Bangla, English, or mixed)."},
+                    {"role": "system", "content": "You are a helpful WhatsApp assistant. You have access to real-time web search results. Reply naturally and concisely. Match the language of the user (Bangla, English, or mixed)."},
                     {"role": "user", "content": user_text},
                 ],
             },
@@ -128,11 +147,9 @@ def start_whatsapp_background():
         _started["value"] = True
 
     def thread_main():
-        # Declare global at the very top of the function
         global DB_FILE
         
         try:
-            # Try to create the directory, fallback to /tmp if permission denied
             try:
                 DB_FILE.parent.mkdir(parents=True, exist_ok=True)
             except PermissionError:
@@ -143,7 +160,6 @@ def start_whatsapp_background():
             wa = WhatsApp(str(DB_FILE))
             wa_ref["client"] = wa
 
-            # --- QR code callback ---
             @wa.on_qr
             def handle_qr(code: str):
                 try:
@@ -155,13 +171,11 @@ def start_whatsapp_background():
                     log.exception("Failed to render QR")
                     update_state(error=f"QR render error: {e}")
 
-            # --- Pairing code callback (optional) ---
             @wa.on_pair_code
             def handle_pair_code(code: str):
                 update_state(pair_code=code, status="waiting_for_pair_code", qr=None)
                 log.info("Pairing code generated: %s", code)
 
-            # --- Connected callback ---
             @wa.on_connected
             def handle_connected():
                 update_state(
@@ -174,13 +188,11 @@ def start_whatsapp_background():
                 )
                 log.info("WhatsApp connected successfully.")
 
-            # --- Disconnect callback ---
             @wa.on_disconnect
             def handle_disconnect():
                 update_state(status="disconnected", connected=False)
                 log.warning("WhatsApp disconnected. wars will attempt to reconnect.")
 
-            # --- Message handler ---
             @wa.on_message
             def handle_message(msg):
                 try:
@@ -195,11 +207,16 @@ def start_whatsapp_background():
 
                     chat = getattr(msg, "chat", "") or ""
                     sender = normalize_number(chat)
-                    if not ALLOWED_PHONE:
-                        log.warning("ALLOWED_PHONE_NUMBER not set — ignoring all messages")
-                        return
-                    if sender != ALLOWED_PHONE:
-                        log.info("Ignored message from %s", sender or "<unknown>")
+
+                    # --- UPDATED SECURITY CHECK ---
+                    is_allowed = False
+                    if ALLOWED_PHONE and sender == ALLOWED_PHONE:
+                        is_allowed = True
+                    elif sender in ALLOWED_LIDS:
+                        is_allowed = True
+
+                    if not is_allowed:
+                        log.info("Ignored message from %s (Not in ALLOWED_PHONE or ALLOWED_LIDS)", sender or "<unknown>")
                         return
 
                     text = extract_text(msg)
@@ -209,6 +226,7 @@ def start_whatsapp_background():
                     update_state(last_message=f"Received {len(text)} chars from {sender}")
                     log.info("Handling message from %s (%d chars)", sender, len(text))
 
+                    # The AI will now search the web if ENABLE_WEB_SEARCH is True
                     reply = ask_openrouter(text)
                     wa.send(msg.chat, reply)
                     with state_lock:
