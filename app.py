@@ -1,21 +1,23 @@
 """
-Pure-Python WhatsApp AI Bot
+Pure-Python WhatsApp AI Bot (using wars)
+- Flask dashboard with QR/Pairing Code login
+- wars for WhatsApp Web protocol (Rust-powered, Python bindings)
+- OpenRouter for AI replies
+- Single process, single worker — do not scale horizontally.
 """
 
-import asyncio
-import base64
 import logging
 import os
 import re
 import threading
+import time
 from collections import deque
-from io import BytesIO
 from pathlib import Path
 
-import qrcode
 import requests
 from dotenv import load_dotenv
 from flask import Flask, jsonify, render_template, request, abort
+from wars import WhatsApp
 
 load_dotenv()
 
@@ -34,17 +36,20 @@ OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openrouter/free").strip()
 PUBLIC_APP_URL = os.getenv("PUBLIC_APP_URL", "").strip() or "https://render.com"
 DASHBOARD_TOKEN = os.getenv("DASHBOARD_TOKEN", "").strip()
 
-AUTH_FILE = Path(os.getenv("PIWAPP_AUTH_FILE", "/var/data/whatsapp/auth.json"))
-KEYS_FILE = Path(str(AUTH_FILE) + ".keys")
-DB_FILE = Path(str(AUTH_FILE) + ".db")
+# wars uses a single SQLite database file for session persistence
+DB_FILE = Path(os.getenv("WARS_DB_FILE", "/var/data/whatsapp.db"))
 
 MAX_INPUT_CHARS = 4000
 RECENT_MESSAGE_IDS = deque(maxlen=300)
 
+# ---------------------------------------------------------------------------
+# Shared state
+# ---------------------------------------------------------------------------
 state = {
     "status": "starting",
     "connected": False,
     "qr": None,
+    "pair_code": None,
     "account": None,
     "error": None,
     "last_message": None,
@@ -52,7 +57,7 @@ state = {
 }
 state_lock = threading.Lock()
 
-client_ref = {"client": None, "loop": None}
+wa_ref = {"client": None}
 start_lock = threading.Lock()
 _started = {"value": False}
 
@@ -69,13 +74,6 @@ def snapshot():
         return dict(state)
 
 
-def qr_data_uri(value: str) -> str:
-    img = qrcode.make(value)
-    buf = BytesIO()
-    img.save(buf, format="PNG")
-    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
-
-
 def normalize_number(jid: str) -> str:
     if not jid or "@" not in jid:
         return ""
@@ -84,20 +82,11 @@ def normalize_number(jid: str) -> str:
     return re.sub(r"\D", "", head)
 
 
-def extract_text(message: dict) -> str:
-    if message.get("text"):
-        return str(message["text"]).strip()
-    msg = message.get("message") or {}
-    candidates = [
-        msg.get("conversation"),
-        (msg.get("extendedTextMessage") or {}).get("text"),
-        (msg.get("imageMessage") or {}).get("caption"),
-        (msg.get("videoMessage") or {}).get("caption"),
-        (msg.get("documentMessage") or {}).get("caption"),
-    ]
-    for value in candidates:
-        if isinstance(value, str) and value.strip():
-            return value.strip()
+def extract_text(msg) -> str:
+    # wars Message object has a .text attribute
+    text = getattr(msg, "text", None)
+    if text:
+        return str(text).strip()
     return ""
 
 
@@ -134,6 +123,9 @@ def ask_openrouter(user_text: str) -> str:
         return "Sorry, I couldn't get an AI answer right now. Please try again shortly."
 
 
+# ---------------------------------------------------------------------------
+# WhatsApp background thread (using wars)
+# ---------------------------------------------------------------------------
 def start_whatsapp_background():
     with start_lock:
         if _started["value"]:
@@ -142,125 +134,108 @@ def start_whatsapp_background():
 
     def thread_main():
         try:
-            try:
-                from piwapp import Client, ConnectionConfig, AuthenticationCreds
-                from piwapp.events import WAEventType
-            except Exception as import_err:
-                log.exception("Failed to import piwapp.")
-                update_state(status="error", error=f"piwapp import failed: {import_err}")
-                with start_lock:
-                    _started["value"] = False
-                return
-
-            AUTH_FILE.parent.mkdir(parents=True, exist_ok=True)
-            KEYS_FILE.parent.mkdir(parents=True, exist_ok=True)
             DB_FILE.parent.mkdir(parents=True, exist_ok=True)
 
-            # If the session file exists, try to load it. If it fails, delete it and start fresh.
-            if AUTH_FILE.exists():
+            log.info("Initializing wars client with DB: %s", DB_FILE)
+            wa = WhatsApp(str(DB_FILE))
+            wa_ref["client"] = wa
+
+            # --- QR code callback ---
+            @wa.on_qr
+            def handle_qr(code: str):
                 try:
-                    creds = AuthenticationCreds.from_json(AUTH_FILE.read_text(encoding="utf-8"))
-                    log.info("Loaded existing session from %s", AUTH_FILE)
-                except Exception as load_err:
-                    log.warning("Failed to load session file, starting fresh: %s", load_err)
-                    AUTH_FILE.unlink(missing_ok=True)
-                    creds = AuthenticationCreds.initial()
-                    AUTH_FILE.write_text(creds.to_json(), encoding="utf-8")
-            else:
-                creds = AuthenticationCreds.initial()
-                AUTH_FILE.write_text(creds.to_json(), encoding="utf-8")
-                log.info("Created new session file at %s", AUTH_FILE)
+                    from wars import qr_to_data_url
+                    uri = qr_to_data_url(code)
+                    update_state(status="waiting_for_qr", qr=uri, connected=False, error=None)
+                    log.info("QR code generated. Waiting for scan.")
+                except Exception as e:
+                    log.exception("Failed to render QR")
+                    update_state(error=f"QR render error: {e}")
 
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
+            # --- Pairing code callback (optional) ---
+            @wa.on_pair_code
+            def handle_pair_code(code: str):
+                update_state(pair_code=code, status="waiting_for_pair_code", qr=None)
+                log.info("Pairing code generated: %s", code)
 
-            def on_creds_update(c):
+            # --- Connected callback ---
+            @wa.on_connected
+            def handle_connected():
+                update_state(
+                    status="online",
+                    connected=True,
+                    qr=None,
+                    pair_code=None,
+                    account=None,  # wars doesn't expose account ID directly here
+                    error=None,
+                )
+                log.info("WhatsApp connected successfully.")
+
+            # --- Disconnect callback ---
+            @wa.on_disconnect
+            def handle_disconnect():
+                update_state(status="disconnected", connected=False)
+                log.warning("WhatsApp disconnected. wars will attempt to reconnect.")
+
+            # --- Message handler ---
+            @wa.on_message
+            def handle_message(msg):
                 try:
-                    AUTH_FILE.write_text(c.to_json(), encoding="utf-8")
-                except Exception:
-                    log.exception("Failed to persist credentials")
-
-            client = Client(
-                creds,
-                ConnectionConfig(),
-                on_creds_update=on_creds_update,
-                keys_path=str(KEYS_FILE),
-                db_path=str(DB_FILE),
-            )
-            client_ref["client"] = client
-            client_ref["loop"] = loop
-
-            async def on_connection(update: dict):
-                try:
-                    if update.get("qr"):
-                        uri = qr_data_uri(update["qr"])
-                        update_state(status="waiting_for_qr", qr=uri, connected=False, error=None)
-                        log.info("QR code generated. Waiting for scan.")
-                    
-                    conn = update.get("connection")
-                    if conn == "open":
-                        me = (update.get("me") or {}).get("id")
-                        update_state(status="online", connected=True, qr=None, account=me, error=None)
-                        log.info("WhatsApp connected as %s", me)
-                    elif conn == "connecting":
-                        update_state(status="connecting", error=None)
-                    elif conn == "close":
-                        # DO NOT restart manually. piwapp's loop handles reconnection.
-                        update_state(status="disconnected", connected=False)
-                        log.warning("WhatsApp connection closed. piwapp will attempt to reconnect automatically.")
-                except Exception:
-                    log.exception("connection.update handler failed")
-
-            async def handle_message(client, message: dict):
-                try:
-                    key = message.get("key") or {}
-                    if key.get("fromMe"):
+                    if msg.is_from_me:
                         return
-                    msg_id = key.get("id")
+
+                    # Deduplication (wars Message has .id)
+                    msg_id = getattr(msg, "id", None)
                     if msg_id:
                         if msg_id in RECENT_MESSAGE_IDS:
                             return
                         RECENT_MESSAGE_IDS.append(msg_id)
-                    remote_jid = key.get("remoteJid") or ""
-                    if not remote_jid.endswith("@s.whatsapp.net"):
-                        return
-                    sender = normalize_number(key.get("participant") or remote_jid)
+
+                    # Get sender JID / phone
+                    chat = getattr(msg, "chat", "") or ""
+                    sender = normalize_number(chat)
                     if not ALLOWED_PHONE:
                         log.warning("ALLOWED_PHONE_NUMBER not set — ignoring all messages")
                         return
                     if sender != ALLOWED_PHONE:
                         log.info("Ignored message from %s", sender or "<unknown>")
                         return
-                    text = extract_text(message)
+
+                    text = extract_text(msg)
                     if not text:
                         return
+
                     update_state(last_message=f"Received {len(text)} chars from {sender}")
                     log.info("Handling message from %s (%d chars)", sender, len(text))
-                    reply = await asyncio.to_thread(ask_openrouter, text)
-                    await client.send_text(remote_jid, reply)
+
+                    # Call OpenRouter (synchronous, blocking — but wars runs its own loop)
+                    reply = ask_openrouter(text)
+                    wa.send(msg.chat, reply)
                     with state_lock:
                         state["messages_handled"] += 1
                 except Exception:
                     log.exception("handle_message failed")
                     update_state(error="Error while processing an incoming message.")
 
-            def on_messages(payload):
-                messages = getattr(payload, "messages", None)
-                if messages is None and isinstance(payload, dict):
-                    messages = payload.get("messages", [])
-                for msg in messages or []:
-                    asyncio.run_coroutine_threadsafe(handle_message(client, msg), loop)
-
-            client.on("connection.update", on_connection)
-            client.events.on(WAEventType.MESSAGES_UPSERT, on_messages)
-
+            # Start connection
             update_state(status="connecting", error=None)
-            log.info("Starting piwapp client loop...")
-            loop.run_until_complete(client.start())
+            log.info("Connecting wars client...")
+            # connect() starts a background run loop
+            wa.connect()
+            # wait until ready (or timeout) — this blocks the thread
+            wa.wait_until_ready(timeout=120)
+            log.info("wars client ready and running.")
+            # Keep thread alive
+            while True:
+                time.sleep(10)
 
         except Exception as exc:
             log.exception("WhatsApp startup failed entirely")
-            update_state(status="error", connected=False, error=f"Startup failed: {type(exc).__name__}")
+            update_state(
+                status="error",
+                connected=False,
+                error=f"Startup failed: {type(exc).__name__}: {exc}",
+            )
         finally:
             with start_lock:
                 _started["value"] = False
@@ -268,6 +243,9 @@ def start_whatsapp_background():
     threading.Thread(target=thread_main, name="whatsapp-client", daemon=True).start()
 
 
+# ---------------------------------------------------------------------------
+# Dashboard auth
+# ---------------------------------------------------------------------------
 def _authorized() -> bool:
     if not DASHBOARD_TOKEN:
         return True
@@ -285,6 +263,9 @@ def _gate_dashboard():
         abort(401)
 
 
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
 @app.get("/")
 def index():
     start_whatsapp_background()
