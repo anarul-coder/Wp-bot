@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>WhatsApp AI Bot</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 20px;
+      font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+      background: #0b141a; color: #f5f7f8;
+    }
+    main {
+      width: min(100%, 560px); background: #17232b; border: 1px solid #2b3a43;
+      border-radius: 22px; padding: 26px; box-shadow: 0 18px 55px #0005;
+    }
+    h1 { margin: 0 0 6px; font-size: 1.5rem; }
+    p { color: #aebac1; line-height: 1.5; margin: 6px 0; }
+    .pill {
+      display: inline-block; padding: 7px 12px; border-radius: 999px;
+      background: #263943; font-size: .9rem; margin: 10px 0 16px;
+    }
+    .pill.online { background: #1f4d33; color: #b7f2c5; }
+    .pill.error  { background: #4d2323; color: #f2b7b7; }
+    .qrbox {
+      background: #fff; border-radius: 16px; min-height: 280px;
+      display: grid; place-items: center; padding: 18px; margin: 16px 0;
+    }
+    .qrbox img { width: min(100%, 280px); height: auto; }
+    .placeholder { color: #24323a; text-align: center; padding: 22px; }
+    .small { font-size: .82rem; }
+    .warn { border-left: 3px solid #e9b949; padding-left: 12px; }
+    .stats { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 12px; }
+    .stat { background: #1e2c35; padding: 10px 14px; border-radius: 10px; font-size: .85rem; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>WhatsApp AI Bot</h1>
+  <p>Link your WhatsApp account by scanning the QR code below.</p>
+  <div class="pill" id="status">Connecting…</div>
+  <div class="qrbox" id="qrbox">
+    <div class="placeholder">Waiting for QR code…</div>
+  </div>
+  <p><b>On your phone:</b> WhatsApp → Linked devices → Link a device → scan this QR.</p>
+  <p class="warn small">
+    Security: keep this dashboard private. Anyone who scans the QR may link a device
+    to your account. Never share the QR or session files.
+  </p>
+  <div class="stats">
+    <div class="stat">Messages handled: <b id="count">0</b></div>
+    <div class="stat">Account: <b id="account">—</b></div>
+  </div>
+  <p class="small" id="extra"></p>
+</main>
+<script>
+  const $ = (id) => document.getElementById(id);
+  async function refresh() {
+    try {
+      const r = await fetch('/api/status', { cache: 'no-store' });
+      const d = await r.json();
+      const pill = $('status');
+      pill.className = 'pill';
+      if (d.connected) {
+        pill.textContent = 'Connected ✓';
+        pill.classList.add('online');
+        $('qrbox').innerHTML =
+          '<div class="placeholder"><h2>WhatsApp linked</h2>' +
+          '<p>You can close this page. Keep the server running.</p></div>';
+      } else {
+        pill.textContent = 'Status: ' + (d.status || 'unknown');
+        if (d.status === 'error') pill.classList.add('error');
+        if (d.qr) {
+          $('qrbox').innerHTML =
+            '<img alt="WhatsApp linking QR code" src="' + d.qr + '">';
+        } else {
+          $('qrbox').innerHTML =
+            '<div class="placeholder">QR not ready yet.<br>Wait a few seconds.</div>';
+        }
+      }
+      $('count').textContent = d.messages_handled ?? 0;
+      $('account').textContent = d.account || '—';
+      $('extra').textContent = d.error || d.last_message || '';
+    } catch (e) {
+      $('status').textContent = 'Server unavailable';
+    }
+  }
+  refresh();
+  setInterval(refresh, 3000);
+</script>
+</body>
+</html>
