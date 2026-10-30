@@ -128,13 +128,15 @@ def start_whatsapp_background():
         _started["value"] = True
 
     def thread_main():
+        # Declare global at the very top of the function
+        global DB_FILE
+        
         try:
             # Try to create the directory, fallback to /tmp if permission denied
             try:
                 DB_FILE.parent.mkdir(parents=True, exist_ok=True)
             except PermissionError:
                 log.warning("Permission denied for %s. Falling back to /tmp", DB_FILE)
-                global DB_FILE
                 DB_FILE = Path("/tmp/whatsapp.db")
 
             log.info("Initializing wars client with DB: %s", DB_FILE)
