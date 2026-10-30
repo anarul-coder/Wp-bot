@@ -30,11 +30,11 @@
   <p><b>On your phone:</b> WhatsApp → Linked devices → Link a device → scan this QR.</p>
 </main>
 <script>
-  // Grab the token from the URL (e.g. ?token=sudo)
+  // Grab the token from the URL (?token=...)
   const urlParams = new URLSearchParams(window.location.search);
   const token = urlParams.get('token');
   
-  // Append it to API requests so Flask doesn't return 401 Unauthorized
+  // Append it to the API request
   const apiUrl = token ? `/api/status?token=${token}` : '/api/status';
 
   async function refresh() {
