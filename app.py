@@ -1,9 +1,5 @@
 """
 Pure-Python WhatsApp AI Bot
-- Flask dashboard with QR login
-- piwapp for WhatsApp Web protocol (unofficial)
-- OpenRouter for AI replies
-- Single process, single worker — do not scale horizontally.
 """
 
 import asyncio
@@ -45,9 +41,6 @@ DB_FILE = Path(str(AUTH_FILE) + ".db")
 MAX_INPUT_CHARS = 4000
 RECENT_MESSAGE_IDS = deque(maxlen=300)
 
-# ---------------------------------------------------------------------------
-# Shared state
-# ---------------------------------------------------------------------------
 state = {
     "status": "starting",
     "connected": False,
@@ -63,9 +56,6 @@ client_ref = {"client": None, "loop": None}
 start_lock = threading.Lock()
 _started = {"value": False}
 
-# ---------------------------------------------------------------------------
-# Flask app
-# ---------------------------------------------------------------------------
 app = Flask(__name__, template_folder="templates")
 
 
@@ -79,9 +69,6 @@ def snapshot():
         return dict(state)
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 def qr_data_uri(value: str) -> str:
     img = qrcode.make(value)
     buf = BytesIO()
@@ -100,7 +87,6 @@ def normalize_number(jid: str) -> str:
 def extract_text(message: dict) -> str:
     if message.get("text"):
         return str(message["text"]).strip()
-
     msg = message.get("message") or {}
     candidates = [
         msg.get("conversation"),
@@ -115,16 +101,11 @@ def extract_text(message: dict) -> str:
     return ""
 
 
-# ---------------------------------------------------------------------------
-# OpenRouter
-# ---------------------------------------------------------------------------
 def ask_openrouter(user_text: str) -> str:
     if not OPENROUTER_API_KEY:
         return "Bot is not fully configured: OPENROUTER_API_KEY is missing."
-
     if len(user_text) > MAX_INPUT_CHARS:
         user_text = user_text[:MAX_INPUT_CHARS]
-
     try:
         resp = requests.post(
             "https://openrouter.ai/api/v1/chat/completions",
@@ -137,13 +118,7 @@ def ask_openrouter(user_text: str) -> str:
             json={
                 "model": OPENROUTER_MODEL,
                 "messages": [
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are a helpful WhatsApp assistant. Reply naturally and concisely. "
-                            "Match the language of the user (Bangla, English, or mixed)."
-                        ),
-                    },
+                    {"role": "system", "content": "You are a helpful WhatsApp assistant. Reply naturally and concisely. Match the language of the user (Bangla, English, or mixed)."},
                     {"role": "user", "content": user_text},
                 ],
             },
@@ -159,9 +134,6 @@ def ask_openrouter(user_text: str) -> str:
         return "Sorry, I couldn't get an AI answer right now. Please try again shortly."
 
 
-# ---------------------------------------------------------------------------
-# WhatsApp background thread
-# ---------------------------------------------------------------------------
 def start_whatsapp_background():
     with start_lock:
         if _started["value"]:
@@ -184,18 +156,20 @@ def start_whatsapp_background():
             KEYS_FILE.parent.mkdir(parents=True, exist_ok=True)
             DB_FILE.parent.mkdir(parents=True, exist_ok=True)
 
-            if str(AUTH_FILE).startswith("/tmp/") and os.getenv("RENDER"):
-                log.warning(
-                    "Using /tmp for WhatsApp session — login will be lost on restart. "
-                    "Mount a persistent disk and set PIWAPP_AUTH_FILE under it."
-                )
-
-            # Load or create credentials
+            # If the session file exists, try to load it. If it fails, delete it and start fresh.
             if AUTH_FILE.exists():
-                creds = AuthenticationCreds.from_json(AUTH_FILE.read_text(encoding="utf-8"))
+                try:
+                    creds = AuthenticationCreds.from_json(AUTH_FILE.read_text(encoding="utf-8"))
+                    log.info("Loaded existing session from %s", AUTH_FILE)
+                except Exception as load_err:
+                    log.warning("Failed to load session file, starting fresh: %s", load_err)
+                    AUTH_FILE.unlink(missing_ok=True)
+                    creds = AuthenticationCreds.initial()
+                    AUTH_FILE.write_text(creds.to_json(), encoding="utf-8")
             else:
                 creds = AuthenticationCreds.initial()
                 AUTH_FILE.write_text(creds.to_json(), encoding="utf-8")
+                log.info("Created new session file at %s", AUTH_FILE)
 
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
@@ -216,60 +190,40 @@ def start_whatsapp_background():
             client_ref["client"] = client
             client_ref["loop"] = loop
 
-            # ---- connection.update ----
             async def on_connection(update: dict):
                 try:
                     if update.get("qr"):
                         uri = qr_data_uri(update["qr"])
-                        update_state(
-                            status="waiting_for_qr",
-                            qr=uri,
-                            connected=False,
-                            error=None,
-                        )
+                        update_state(status="waiting_for_qr", qr=uri, connected=False, error=None)
                         log.info("QR code generated. Waiting for scan.")
                     
                     conn = update.get("connection")
                     if conn == "open":
                         me = (update.get("me") or {}).get("id")
-                        update_state(
-                            status="online",
-                            connected=True,
-                            qr=None,
-                            account=me,
-                            error=None,
-                        )
+                        update_state(status="online", connected=True, qr=None, account=me, error=None)
                         log.info("WhatsApp connected as %s", me)
                     elif conn == "connecting":
                         update_state(status="connecting", error=None)
                     elif conn == "close":
+                        # DO NOT restart manually. piwapp's loop handles reconnection.
                         update_state(status="disconnected", connected=False)
-                        log.warning("WhatsApp connection closed. Restarting client in 5 seconds...")
-                        
-                        # FIX: Automatically restart the connection loop after 5 seconds
-                        # so the app doesn't get permanently stuck.
-                        loop.call_later(5, start_whatsapp_background)
-                        
+                        log.warning("WhatsApp connection closed. piwapp will attempt to reconnect automatically.")
                 except Exception:
                     log.exception("connection.update handler failed")
 
-            # ---- message handler ----
             async def handle_message(client, message: dict):
                 try:
                     key = message.get("key") or {}
                     if key.get("fromMe"):
                         return
-
                     msg_id = key.get("id")
                     if msg_id:
                         if msg_id in RECENT_MESSAGE_IDS:
                             return
                         RECENT_MESSAGE_IDS.append(msg_id)
-
                     remote_jid = key.get("remoteJid") or ""
                     if not remote_jid.endswith("@s.whatsapp.net"):
                         return
-
                     sender = normalize_number(key.get("participant") or remote_jid)
                     if not ALLOWED_PHONE:
                         log.warning("ALLOWED_PHONE_NUMBER not set — ignoring all messages")
@@ -277,17 +231,13 @@ def start_whatsapp_background():
                     if sender != ALLOWED_PHONE:
                         log.info("Ignored message from %s", sender or "<unknown>")
                         return
-
                     text = extract_text(message)
                     if not text:
                         return
-
                     update_state(last_message=f"Received {len(text)} chars from {sender}")
                     log.info("Handling message from %s (%d chars)", sender, len(text))
-
                     reply = await asyncio.to_thread(ask_openrouter, text)
                     await client.send_text(remote_jid, reply)
-                    
                     with state_lock:
                         state["messages_handled"] += 1
                 except Exception:
@@ -301,23 +251,16 @@ def start_whatsapp_background():
                 for msg in messages or []:
                     asyncio.run_coroutine_threadsafe(handle_message(client, msg), loop)
 
-            # Register listeners
             client.on("connection.update", on_connection)
             client.events.on(WAEventType.MESSAGES_UPSERT, on_messages)
 
             update_state(status="connecting", error=None)
             log.info("Starting piwapp client loop...")
-            
-            # This blocks the thread and runs the WhatsApp client
             loop.run_until_complete(client.start())
 
         except Exception as exc:
             log.exception("WhatsApp startup failed entirely")
-            update_state(
-                status="error",
-                connected=False,
-                error=f"Startup failed: {type(exc).__name__}",
-            )
+            update_state(status="error", connected=False, error=f"Startup failed: {type(exc).__name__}")
         finally:
             with start_lock:
                 _started["value"] = False
@@ -325,9 +268,6 @@ def start_whatsapp_background():
     threading.Thread(target=thread_main, name="whatsapp-client", daemon=True).start()
 
 
-# ---------------------------------------------------------------------------
-# Dashboard auth (optional, controlled by DASHBOARD_TOKEN)
-# ---------------------------------------------------------------------------
 def _authorized() -> bool:
     if not DASHBOARD_TOKEN:
         return True
@@ -345,9 +285,6 @@ def _gate_dashboard():
         abort(401)
 
 
-# ---------------------------------------------------------------------------
-# Routes
-# ---------------------------------------------------------------------------
 @app.get("/")
 def index():
     start_whatsapp_background()
