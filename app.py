@@ -170,12 +170,11 @@ def start_whatsapp_background():
 
     def thread_main():
         try:
-            # Verify imports explicitly so errors are caught
             try:
                 from piwapp import Client, ConnectionConfig, AuthenticationCreds
                 from piwapp.events import WAEventType
             except Exception as import_err:
-                log.exception("Failed to import piwapp. Is it in requirements.txt?")
+                log.exception("Failed to import piwapp.")
                 update_state(status="error", error=f"piwapp import failed: {import_err}")
                 with start_lock:
                     _started["value"] = False
@@ -218,7 +217,6 @@ def start_whatsapp_background():
             client_ref["loop"] = loop
 
             # ---- connection.update ----
-            # CRITICAL FIX: piwapp requires this to be an `async def` to capture QR codes
             async def on_connection(update: dict):
                 try:
                     if update.get("qr"):
@@ -246,7 +244,12 @@ def start_whatsapp_background():
                         update_state(status="connecting", error=None)
                     elif conn == "close":
                         update_state(status="disconnected", connected=False)
-                        log.warning("WhatsApp connection closed")
+                        log.warning("WhatsApp connection closed. Restarting client in 5 seconds...")
+                        
+                        # FIX: Automatically restart the connection loop after 5 seconds
+                        # so the app doesn't get permanently stuck.
+                        loop.call_later(5, start_whatsapp_background)
+                        
                 except Exception:
                     log.exception("connection.update handler failed")
 
