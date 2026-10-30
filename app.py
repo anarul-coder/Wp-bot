@@ -1,201 +1,358 @@
+"""
+Pure-Python WhatsApp AI Bot
+- Flask dashboard with QR login
+- piwapp for WhatsApp Web protocol (unofficial)
+- OpenRouter for AI replies
+- Single process, single worker — do not scale horizontally.
+"""
+
+import asyncio
+import base64
+import logging
 import os
 import re
-import json
-import asyncio
 import threading
-import base64
+from collections import deque
 from io import BytesIO
 from pathlib import Path
 
-import requests
 import qrcode
+import requests
 from dotenv import load_dotenv
-from flask import Flask, jsonify, render_template_string
+from flask import Flask, jsonify, render_template, request, abort
 
 load_dotenv()
-app = Flask(__name__)
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+log = logging.getLogger("wa-bot")
 
 ALLOWED_PHONE = re.sub(r"\D", "", os.getenv("ALLOWED_PHONE_NUMBER", ""))
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openrouter/free")
-AUTH_FILE = Path(os.getenv("PIWAPP_AUTH_FILE", "/var/data/piwapp_auth.json"))
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openrouter/free").strip()
+PUBLIC_APP_URL = os.getenv("PUBLIC_APP_URL", "").strip() or "https://render.com"
+DASHBOARD_TOKEN = os.getenv("DASHBOARD_TOKEN", "").strip()
+
+AUTH_FILE = Path(os.getenv("PIWAPP_AUTH_FILE", "/var/data/whatsapp/auth.json"))
 KEYS_FILE = Path(str(AUTH_FILE) + ".keys")
 DB_FILE = Path(str(AUTH_FILE) + ".db")
 
-state = {"connected": False, "qr": None, "message": "Starting WhatsApp client…"}
+MAX_INPUT_CHARS = 4000
+RECENT_MESSAGE_IDS = deque(maxlen=300)
+
+# ---------------------------------------------------------------------------
+# Shared state
+# ---------------------------------------------------------------------------
+state = {
+    "status": "starting",
+    "connected": False,
+    "qr": None,
+    "account": None,
+    "error": None,
+    "last_message": None,
+    "messages_handled": 0,
+}
+state_lock = threading.Lock()
+
 client_ref = {"client": None, "loop": None}
 start_lock = threading.Lock()
+_started = {"value": False}
 
-HTML = """
-<!doctype html>
-<html lang="en"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>WhatsApp Python QR Bot</title>
-<style>
-body{font-family:system-ui,sans-serif;max-width:680px;margin:32px auto;padding:0 16px;background:#f5f7f8;color:#18212b}
-main{background:white;padding:24px;border-radius:16px;box-shadow:0 3px 18px #0001}
-h1{font-size:1.5rem}#qr{max-width:300px;width:100%;image-rendering:auto}
-.status{padding:12px;border-radius:8px;background:#eef4f6;margin:12px 0}
-small{color:#5c6670}.refresh{margin-top:14px;padding:10px 16px}
-</style></head><body><main>
-<h1>WhatsApp AI Bot — Python QR Login</h1>
-<div class="status" id="status">Loading status…</div>
-<div id="qrbox"><p>Waiting for QR code…</p></div>
-<p><small>On your phone: WhatsApp → Linked devices → Link a device → scan this QR.</small></p>
-<button class="refresh" onclick="refresh()">Refresh status</button>
-</main>
-<script>
-async function refresh(){
-  try {
-    const r=await fetch('/api/status'); const d=await r.json();
-    document.getElementById('status').textContent=d.message || (d.connected?'Connected':'Waiting for connection');
-    const box=document.getElementById('qrbox');
-    if(d.connected){box.innerHTML='<p>✅ WhatsApp is connected.</p>';}
-    else if(d.qr){box.innerHTML='<img id="qr" alt="WhatsApp QR code" src="'+d.qr+'">';}
-    else {box.innerHTML='<p>Waiting for QR code… refresh in a few seconds.</p>';}
-  } catch(e){document.getElementById('status').textContent='Could not get status. Check Render logs.';}
-}
-refresh(); setInterval(refresh,3000);
-</script></body></html>
-"""
+# ---------------------------------------------------------------------------
+# Flask app
+# ---------------------------------------------------------------------------
+app = Flask(__name__, template_folder="templates")
 
-def save_qr_data_uri(qr_value):
-    if not qr_value:
-        return None
-    try:
-        img = qrcode.make(str(qr_value))
-        buf = BytesIO()
-        img.save(buf, format="PNG")
-        return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
-    except Exception as exc:
-        print("QR render error:", repr(exc))
-        return None
 
-def ask_openrouter(message):
+def update_state(**kwargs):
+    with state_lock:
+        state.update(kwargs)
+
+
+def snapshot():
+    with state_lock:
+        return dict(state)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def qr_data_uri(value: str) -> str:
+    img = qrcode.make(value)
+    buf = BytesIO()
+    img.save(buf, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def normalize_number(jid: str) -> str:
+    if not jid or "@" not in jid:
+        return ""
+    head = jid.split("@", 1)[0]
+    # WhatsApp sometimes appends ":device" to the number part.
+    head = head.split(":", 1)[0]
+    return re.sub(r"\D", "", head)
+
+
+def extract_text(message: dict) -> str:
+    """Pull text from common WhatsApp message shapes."""
+    if message.get("text"):
+        return str(message["text"]).strip()
+
+    msg = message.get("message") or {}
+    candidates = [
+        msg.get("conversation"),
+        (msg.get("extendedTextMessage") or {}).get("text"),
+        (msg.get("imageMessage") or {}).get("caption"),
+        (msg.get("videoMessage") or {}).get("caption"),
+        (msg.get("documentMessage") or {}).get("caption"),
+    ]
+    for value in candidates:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+# ---------------------------------------------------------------------------
+# OpenRouter
+# ---------------------------------------------------------------------------
+def ask_openrouter(user_text: str) -> str:
     if not OPENROUTER_API_KEY:
-        return "Bot setup incomplete: OPENROUTER_API_KEY is missing."
+        return "Bot is not fully configured: OPENROUTER_API_KEY is missing."
+
+    if len(user_text) > MAX_INPUT_CHARS:
+        user_text = user_text[:MAX_INPUT_CHARS]
+
     try:
-        response = requests.post(
+        resp = requests.post(
             "https://openrouter.ai/api/v1/chat/completions",
             headers={
                 "Authorization": f"Bearer {OPENROUTER_API_KEY}",
                 "Content-Type": "application/json",
-                "HTTP-Referer": os.getenv("PUBLIC_APP_URL", "https://render.com"),
+                "HTTP-Referer": PUBLIC_APP_URL,
                 "X-Title": "Python WhatsApp AI Bot",
             },
             json={
                 "model": OPENROUTER_MODEL,
                 "messages": [
-                    {"role": "system", "content": "You are a helpful WhatsApp assistant. Reply briefly in the language used by the sender, including Bangla or English."},
-                    {"role": "user", "content": message},
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a helpful WhatsApp assistant. Reply naturally and concisely. "
+                            "Match the language of the user (Bangla, English, or mixed)."
+                        ),
+                    },
+                    {"role": "user", "content": user_text},
                 ],
             },
             timeout=45,
         )
-        response.raise_for_status()
-        return response.json()["choices"][0]["message"]["content"].strip()
-    except Exception as exc:
-        print("OpenRouter error:", repr(exc))
-        return "দুঃখিত, AI উত্তর দিতে পারছে না। একটু পরে আবার চেষ্টা করুন।"
+        if not resp.ok:
+            log.error("OpenRouter HTTP %s: %s", resp.status_code, resp.text[:400])
+            return f"AI service temporarily unavailable (HTTP {resp.status_code})."
 
-def sender_phone(jid):
-    if not jid or not jid.endswith("@s.whatsapp.net"):
-        return ""
-    return re.sub(r"\D", "", jid.split("@", 1)[0])
+        data = resp.json()
+        return data["choices"][0]["message"]["content"].strip()
+    except Exception:
+        log.exception("OpenRouter request failed")
+        return "Sorry, I couldn't get an AI answer right now. Please try again shortly."
 
-def start_whatsapp_thread():
+
+# ---------------------------------------------------------------------------
+# WhatsApp background thread
+# ---------------------------------------------------------------------------
+def start_whatsapp_background():
     with start_lock:
-        if client_ref["loop"] is not None:
+        if _started["value"]:
             return
+        _started["value"] = True
 
-        def runner():
-            try:
-                from piwapp import Client, ConnectionConfig, AuthenticationCreds
-                from piwapp.events import WAEventType
+    def thread_main():
+        try:
+            # Imported inside the thread so import errors don't crash Flask.
+            from piwapp import Client, ConnectionConfig, AuthenticationCreds
+            from piwapp.events import WAEventType
 
-                AUTH_FILE.parent.mkdir(parents=True, exist_ok=True)
+            AUTH_FILE.parent.mkdir(parents=True, exist_ok=True)
+            KEYS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            DB_FILE.parent.mkdir(parents=True, exist_ok=True)
 
-                if AUTH_FILE.exists():
-                    creds = AuthenticationCreds.from_json(AUTH_FILE.read_text())
-                else:
-                    creds = AuthenticationCreds.initial()
-                    AUTH_FILE.write_text(creds.to_json())
-
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                client_ref["loop"] = loop
-
-                async def on_connection(update):
-                    if "qr" in update:
-                        state["qr"] = save_qr_data_uri(update["qr"])
-                        state["connected"] = False
-                        state["message"] = "Scan the QR code with WhatsApp Linked Devices."
-                    if update.get("connection") == "open":
-                        state["connected"] = True
-                        state["qr"] = None
-                        state["message"] = "WhatsApp connected successfully."
-
-                async def handle_message(m):
-                    try:
-                        key = m.get("key") or {}
-                        if key.get("fromMe"):
-                            return
-                        jid = key.get("remoteJid", "")
-                        phone = sender_phone(jid)
-                        text = (m.get("text") or "").strip()
-                        if not phone or not text:
-                            return
-                        if not ALLOWED_PHONE or phone != ALLOWED_PHONE:
-                            print("Ignored message from a non-allowed number.")
-                            return
-                        client = client_ref["client"]
-                        reply = await asyncio.to_thread(ask_openrouter, text)
-                        await client.send_text(jid, reply)
-                    except Exception as exc:
-                        print("Message handling error:", repr(exc))
-
-                def on_messages(payload):
-                    messages = getattr(payload, "messages", None)
-                    if messages is None and isinstance(payload, dict):
-                        messages = payload.get("messages", [])
-                    for m in messages or []:
-                        asyncio.run_coroutine_threadsafe(handle_message(m), loop)
-
-                client = Client(
-                    creds,
-                    ConnectionConfig(),
-                    on_creds_update=lambda c: AUTH_FILE.write_text(c.to_json()),
-                    keys_path=str(KEYS_FILE),
-                    db_path=str(DB_FILE),
+            if str(AUTH_FILE).startswith("/tmp/") and os.getenv("RENDER"):
+                log.warning(
+                    "Using /tmp for WhatsApp session — login will be lost on restart. "
+                    "Mount a persistent disk and set PIWAPP_AUTH_FILE under it."
                 )
-                client_ref["client"] = client
-                client.on("connection.update", on_connection)
-                client.events.on(WAEventType.MESSAGES_UPSERT, on_messages)
 
-                state["message"] = "Connecting to WhatsApp…"
-                loop.run_until_complete(client.start())
+            if AUTH_FILE.exists():
+                creds = AuthenticationCreds.from_json(AUTH_FILE.read_text(encoding="utf-8"))
+            else:
+                creds = AuthenticationCreds.initial()
+                AUTH_FILE.write_text(creds.to_json(), encoding="utf-8")
 
-            except Exception as exc:
-                state["connected"] = False
-                state["message"] = "WhatsApp startup error: " + str(exc)
-                print("WhatsApp startup error:", repr(exc))
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
 
-        threading.Thread(target=runner, daemon=True).start()
+            def on_creds_update(c):
+                try:
+                    AUTH_FILE.write_text(c.to_json(), encoding="utf-8")
+                except Exception:
+                    log.exception("Failed to persist credentials")
 
+            client = Client(
+                creds,
+                ConnectionConfig(),
+                on_creds_update=on_creds_update,
+                keys_path=str(KEYS_FILE),
+                db_path=str(DB_FILE),
+            )
+            client_ref["client"] = client
+            client_ref["loop"] = loop
+
+            # ---- connection.update ----
+            async def on_connection(update: dict):
+                try:
+                    if update.get("qr"):
+                        uri = qr_data_uri(update["qr"])
+                        update_state(
+                            status="waiting_for_qr",
+                            qr=uri,
+                            connected=False,
+                            error=None,
+                        )
+                    conn = update.get("connection")
+                    if conn == "open":
+                        me = (update.get("me") or {}).get("id")
+                        update_state(
+                            status="online",
+                            connected=True,
+                            qr=None,
+                            account=me,
+                            error=None,
+                        )
+                        log.info("WhatsApp connected as %s", me)
+                    elif conn == "connecting":
+                        update_state(status="connecting", error=None)
+                    elif conn == "close":
+                        update_state(status="disconnected", connected=False)
+                        log.warning("WhatsApp connection closed")
+                except Exception:
+                    log.exception("connection.update handler failed")
+
+            # ---- message handler ----
+            async def handle_message(client, message: dict):
+                try:
+                    key = message.get("key") or {}
+                    if key.get("fromMe"):
+                        return
+
+                    msg_id = key.get("id")
+                    if msg_id:
+                        if msg_id in RECENT_MESSAGE_IDS:
+                            return
+                        RECENT_MESSAGE_IDS.append(msg_id)
+
+                    remote_jid = key.get("remoteJid") or ""
+                    # Skip groups, status broadcasts, and other non-DM chats.
+                    if not remote_jid.endswith("@s.whatsapp.net"):
+                        return
+
+                    sender = normalize_number(key.get("participant") or remote_jid)
+                    if not ALLOWED_PHONE:
+                        log.warning("ALLOWED_PHONE_NUMBER not set — ignoring all messages")
+                        return
+                    if sender != ALLOWED_PHONE:
+                        log.info("Ignored message from %s", sender or "<unknown>")
+                        return
+
+                    text = extract_text(message)
+                    if not text:
+                        return
+
+                    update_state(
+                        last_message=f"Received {len(text)} chars from {sender}",
+                    )
+                    log.info("Handling message from %s (%d chars)", sender, len(text))
+
+                    reply = await asyncio.to_thread(ask_openrouter, text)
+                    await client.send_text(remote_jid, reply)
+                    with state_lock:
+                        state["messages_handled"] += 1
+                except Exception:
+                    log.exception("handle_message failed")
+                    update_state(error="Error while processing an incoming message.")
+
+            def on_messages(payload):
+                messages = getattr(payload, "messages", None)
+                if messages is None and isinstance(payload, dict):
+                    messages = payload.get("messages", [])
+                for msg in messages or []:
+                    asyncio.run_coroutine_threadsafe(handle_message(client, msg), loop)
+
+            client.on("connection.update", on_connection)
+            client.events.on(WAEventType.MESSAGES_UPSERT, on_messages)
+
+            update_state(status="connecting", error=None)
+            log.info("Starting piwapp client…")
+            loop.run_until_complete(client.start())
+
+        except Exception as exc:
+            log.exception("WhatsApp startup failed")
+            update_state(
+                status="error",
+                connected=False,
+                error="Startup failed. Check logs for details.",
+            )
+        finally:
+            with start_lock:
+                _started["value"] = False
+
+    threading.Thread(target=thread_main, name="whatsapp-client", daemon=True).start()
+
+
+# ---------------------------------------------------------------------------
+# Dashboard auth (optional, controlled by DASHBOARD_TOKEN)
+# ---------------------------------------------------------------------------
+def _authorized() -> bool:
+    if not DASHBOARD_TOKEN:
+        return True
+    supplied = request.args.get("token") or request.headers.get("X-Dashboard-Token")
+    return supplied == DASHBOARD_TOKEN
+
+
+@app.before_request
+def _gate_dashboard():
+    if request.path in ("/health",):
+        return
+    if request.path.startswith("/static/"):
+        return
+    if not _authorized():
+        abort(401)
+
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
 @app.get("/")
 def index():
-    start_whatsapp_thread()
-    return render_template_string(HTML)
+    start_whatsapp_background()
+    return render_template("dashboard.html")
+
 
 @app.get("/api/status")
 def api_status():
-    start_whatsapp_thread()
-    return jsonify(state)
+    start_whatsapp_background()
+    return jsonify(snapshot())
+
 
 @app.get("/health")
 def health():
-    return jsonify({"ok": True, "service": "python-only-whatsapp-qr-bot"})
+    return jsonify(ok=True, service="python-whatsapp-ai-bot")
+
 
 if __name__ == "__main__":
-    start_whatsapp_thread()
+    start_whatsapp_background()
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
