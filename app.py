@@ -1,9 +1,5 @@
 """
 Pure-Python WhatsApp AI Bot (using wars)
-- Flask dashboard with QR/Pairing Code login
-- wars for WhatsApp Web protocol (Rust-powered, Python bindings)
-- OpenRouter for AI replies
-- Single process, single worker — do not scale horizontally.
 """
 
 import logging
@@ -36,8 +32,8 @@ OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openrouter/free").strip()
 PUBLIC_APP_URL = os.getenv("PUBLIC_APP_URL", "").strip() or "https://render.com"
 DASHBOARD_TOKEN = os.getenv("DASHBOARD_TOKEN", "").strip()
 
-# wars uses a single SQLite database file for session persistence
-DB_FILE = Path(os.getenv("WARS_DB_FILE", "/var/data/whatsapp.db"))
+# Default to /tmp for Render Free Tier compatibility
+DB_FILE = Path(os.getenv("WARS_DB_FILE", "/tmp/whatsapp.db"))
 
 MAX_INPUT_CHARS = 4000
 RECENT_MESSAGE_IDS = deque(maxlen=300)
@@ -83,7 +79,6 @@ def normalize_number(jid: str) -> str:
 
 
 def extract_text(msg) -> str:
-    # wars Message object has a .text attribute
     text = getattr(msg, "text", None)
     if text:
         return str(text).strip()
@@ -134,7 +129,13 @@ def start_whatsapp_background():
 
     def thread_main():
         try:
-            DB_FILE.parent.mkdir(parents=True, exist_ok=True)
+            # Try to create the directory, fallback to /tmp if permission denied
+            try:
+                DB_FILE.parent.mkdir(parents=True, exist_ok=True)
+            except PermissionError:
+                log.warning("Permission denied for %s. Falling back to /tmp", DB_FILE)
+                global DB_FILE
+                DB_FILE = Path("/tmp/whatsapp.db")
 
             log.info("Initializing wars client with DB: %s", DB_FILE)
             wa = WhatsApp(str(DB_FILE))
@@ -166,7 +167,7 @@ def start_whatsapp_background():
                     connected=True,
                     qr=None,
                     pair_code=None,
-                    account=None,  # wars doesn't expose account ID directly here
+                    account=None,
                     error=None,
                 )
                 log.info("WhatsApp connected successfully.")
@@ -184,14 +185,12 @@ def start_whatsapp_background():
                     if msg.is_from_me:
                         return
 
-                    # Deduplication (wars Message has .id)
                     msg_id = getattr(msg, "id", None)
                     if msg_id:
                         if msg_id in RECENT_MESSAGE_IDS:
                             return
                         RECENT_MESSAGE_IDS.append(msg_id)
 
-                    # Get sender JID / phone
                     chat = getattr(msg, "chat", "") or ""
                     sender = normalize_number(chat)
                     if not ALLOWED_PHONE:
@@ -208,7 +207,6 @@ def start_whatsapp_background():
                     update_state(last_message=f"Received {len(text)} chars from {sender}")
                     log.info("Handling message from %s (%d chars)", sender, len(text))
 
-                    # Call OpenRouter (synchronous, blocking — but wars runs its own loop)
                     reply = ask_openrouter(text)
                     wa.send(msg.chat, reply)
                     with state_lock:
@@ -217,15 +215,11 @@ def start_whatsapp_background():
                     log.exception("handle_message failed")
                     update_state(error="Error while processing an incoming message.")
 
-            # Start connection
             update_state(status="connecting", error=None)
             log.info("Connecting wars client...")
-            # connect() starts a background run loop
             wa.connect()
-            # wait until ready (or timeout) — this blocks the thread
             wa.wait_until_ready(timeout=120)
             log.info("wars client ready and running.")
-            # Keep thread alive
             while True:
                 time.sleep(10)
 
